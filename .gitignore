@@ -1,0 +1,30 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training outputs: TensorBoard logs, A2C checkpoints, reward model checkpoints
+runs/
+save/
+rw/
+*.dat
+*.pt
+*.pth
+
+# Episode segment DBs (large; labels.json lives inside them, back it up separately if needed)
+db-*/
+*.npz
+*.tmp
+
+# Videos
+videos/
+*.mp4
+*.gif
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

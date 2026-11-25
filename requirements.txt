@@ -1,0 +1,8 @@
+torch
+numpy
+gymnasium>=1.0
+ale-py>=0.10
+opencv-python-headless
+tensorboard
+nicegui>=3.0
+pillow
