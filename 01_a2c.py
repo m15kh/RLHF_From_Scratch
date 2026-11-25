@@ -10,6 +10,7 @@ Fine-tuning with the learned reward model instead of the game score:
 """
 import argparse
 import collections
+import multiprocessing as mp
 import pathlib
 import queue
 import time
@@ -39,6 +40,7 @@ REPORT_EVERY_SEC = 10
 def make_env(env_idx: int, dev: torch.device, db_path: str | None = None,
              reward_path: str | None = None, metrics_queue: queue.SimpleQueue | None = None,
              test: bool = False) -> gym.Env:
+    
     e = gym.make(atari.ENV_ID)
     if reward_path is not None:
         e = rlhf.RewardModelWrapper(e, pathlib.Path(reward_path), dev=dev, metrics_queue=metrics_queue)
@@ -78,7 +80,7 @@ def test_model(net: AtariA2C, dev: torch.device, episodes: int = TEST_EPISODES) 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dev", default="cpu", help="Device to use, default=cpu")
+    parser.add_argument("--dev", default="cuda", help="Device to use, default=cuda")
     parser.add_argument("-n", "--name", required=True, help="Name of the run, used in TensorBoard")
     parser.add_argument("--save", help="Directory to save best models after testing")
     parser.add_argument("--db-path", help="Directory to store random episode segments for labeling")
@@ -98,13 +100,17 @@ def main():
         save_path = pathlib.Path(args.save)
         save_path.mkdir(parents=True, exist_ok=True)
 
-    metrics_queue = queue.SimpleQueue()
-    envs = [
-        make_env(i, dev, db_path=args.db_path, reward_path=args.reward, metrics_queue=metrics_queue)
-        for i in range(NUM_ENVS)
-    ]
-    obs_shape = envs[0].observation_space.shape
-    n_actions = envs[0].action_space.n
+    # Each env runs in its own process. A Manager queue can be shared between processes.
+    manager = mp.Manager()
+    metrics_queue = manager.Queue()
+    envs = gym.vector.AsyncVectorEnv(
+        [lambda i=i: make_env(i, dev, db_path=args.db_path, reward_path=args.reward, metrics_queue=metrics_queue)
+         for i in range(NUM_ENVS)],
+        context="spawn",  # safe with CUDA in the child processes
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,  # finished env returns the new episode's first obs
+    )
+    obs_shape = envs.single_observation_space.shape
+    n_actions = envs.single_action_space.n
 
     net = AtariA2C(obs_shape, n_actions).to(dev)
     if args.finetune:
@@ -115,7 +121,7 @@ def main():
     optimizer = torch.optim.RMSprop(net.parameters(), lr=args.lr, alpha=0.99, eps=1e-5)
     writer = SummaryWriter(log_dir=f"runs/a2c-{args.name}")
 
-    obs = np.stack([e.reset(seed=args.seed + i)[0] for i, e in enumerate(envs)])
+    obs, _ = envs.reset(seed=args.seed)  # env i gets seed + i
     ep_rewards = np.zeros(NUM_ENVS)
     ep_steps = np.zeros(NUM_ENVS, dtype=np.int64)
     done_rewards = collections.deque(maxlen=100)
@@ -143,23 +149,22 @@ def main():
                     actions = Categorical(logits=logits).sample().cpu().numpy()
                 mb_obs[t] = obs
                 mb_actions[t] = actions
-                for i, env in enumerate(envs):
-                    o, r, is_done, is_tr, _ = env.step(actions[i])
-                    ep_rewards[i] += r
-                    ep_steps[i] += 1
-                    mb_rewards[t, i] = r
-                    # truncation (time limit) is treated as terminal - small bias, much simpler code
-                    mb_dones[t, i] = float(is_done or is_tr)
-                    if is_done or is_tr:
-                        done_rewards.append(ep_rewards[i])
-                        done_steps.append(ep_steps[i])
-                        games_done += 1
-                        writer.add_scalar("episode_reward", ep_rewards[i], step_idx)
-                        writer.add_scalar("episode_steps", ep_steps[i], step_idx)
-                        ep_rewards[i] = 0.0
-                        ep_steps[i] = 0
-                        o, _ = env.reset()
-                    obs[i] = o
+                # all 16 envs step at the same time, each in its own process
+                obs, r, is_done, is_tr, _ = envs.step(actions)
+                # truncation (time limit) is treated as terminal - small bias, much simpler code
+                dones = is_done | is_tr
+                ep_rewards += r
+                ep_steps += 1
+                mb_rewards[t] = r
+                mb_dones[t] = dones
+                for i in np.flatnonzero(dones):
+                    done_rewards.append(ep_rewards[i])
+                    done_steps.append(ep_steps[i])
+                    games_done += 1
+                    writer.add_scalar("episode_reward", ep_rewards[i], step_idx)
+                    writer.add_scalar("episode_steps", ep_steps[i], step_idx)
+                    ep_rewards[i] = 0.0
+                    ep_steps[i] = 0
                 step_idx += NUM_ENVS
 
             # real game score when training on the learned reward
@@ -247,8 +252,8 @@ def main():
             torch.save(net.state_dict(), save_path / "last.dat")
             print(f"Saved {save_path / 'last.dat'}")
         writer.close()
-        for e in envs:
-            e.close()
+        envs.close()
+        manager.shutdown()
 
 
 if __name__ == "__main__":

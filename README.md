@@ -74,7 +74,7 @@ normalize the reward during RL.
 
 ```bash
 ./01_a2c.py --dev cuda -n v1 --save save/v1 --finetune save/v0/best.dat --reward rw/reward-v0.dat \
-            [--db-path db-v1] [--lr 1e-4] [--max-steps 5000000]
+    --db-path db-v1 --lr 1e-4 --max-steps 5000000
 ```
 
 `RewardModelWrapper` replaces the game reward with the model's prediction, and reward clipping is turned off.
